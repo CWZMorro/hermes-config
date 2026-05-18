@@ -51,7 +51,7 @@ const AUDIO_CACHE_DIR = path.join(process.env.HOME || '~', '.hermes', 'audio_cac
 const PAIR_ONLY = args.includes('--pair-only');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
-const DEFAULT_REPLY_PREFIX = '⚕ *Hermes Agent*\n────────────\n';
+const DEFAULT_REPLY_PREFIX = '✦ *Ciel AI Azure*\n────────────\n';
 const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
   ? DEFAULT_REPLY_PREFIX
   : process.env.WHATSAPP_REPLY_PREFIX.replace(/\\n/g, '\n');
@@ -243,8 +243,10 @@ async function startSocket() {
           }));
         } catch { }
       }
-      const senderId = msg.key.participant || chatId;
       const isGroup = chatId.endsWith('@g.us');
+      // For fromMe DMs, participant is null — use the bot's own ID so the gateway
+      // recognizes the message as coming from the authorized account owner.
+      const senderId = msg.key.participant || (msg.key.fromMe && !isGroup ? (sock.user?.id || chatId) : chatId);
       const senderNumber = senderId.replace(/@.*/, '');
 
       // Handle fromMe messages based on mode
@@ -264,7 +266,12 @@ async function startSocket() {
         const myLid = (sock.user?.lid || '').replace(/:.*@/, '@').replace(/@.*/, '');
         const chatNumber = chatId.replace(/@.*/, '');
         const isSelfChat = (myNumber && chatNumber === myNumber) || (myLid && chatNumber === myLid);
-        if (!isSelfChat && !isGroup) continue;
+        if (!isSelfChat && !isGroup) {
+          // Allow explicit !ciel trigger in DMs so the user can invoke the bot in any conversation
+          const earlyContent = getMessageContent(msg);
+          const earlyBody = earlyContent.conversation || earlyContent.extendedTextMessage?.text || '';
+          if (!earlyBody.toLowerCase().startsWith('!ciel')) continue;
+        }
       }
 
       // Handle !fromMe messages (from other people) based on mode.
@@ -272,19 +279,27 @@ async function startSocket() {
       // themselves — stranger DMs / group pings must never reach the
       // Python gateway, otherwise a pairing-code reply fires in response
       // to arbitrary incoming messages (#8389).
+      //
+      // Exception: allowed users who explicitly type "!ciel" in a DM are
+      // let through even in self-chat mode, so the bot can respond to DMs.
       if (!msg.key.fromMe) {
         if (WHATSAPP_MODE === 'self-chat') {
-          try {
-            console.log(JSON.stringify({
-              event: 'ignored',
-              reason: 'self_chat_mode_rejects_non_self',
-              chatId,
-              senderId,
-            }));
-          } catch { }
-          continue;
-        }
-        if (!matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
+          const earlyContent = getMessageContent(msg);
+          const earlyBody = earlyContent.conversation || earlyContent.extendedTextMessage?.text || '';
+          const isExplicitTrigger = earlyBody.toLowerCase().startsWith('!ciel');
+          const isAllowed = matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR);
+          if (!isExplicitTrigger || !isAllowed) {
+            try {
+              console.log(JSON.stringify({
+                event: 'ignored',
+                reason: isExplicitTrigger ? 'allowlist_mismatch' : 'self_chat_mode_rejects_non_self',
+                chatId,
+                senderId,
+              }));
+            } catch { }
+            continue;
+          }
+        } else if (!matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
           try {
             console.log(JSON.stringify({
               event: 'ignored',
