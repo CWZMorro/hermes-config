@@ -1,6 +1,6 @@
 model:
-  default: gemini-3.1-flash-lite
-  provider: google
+  default: anthropic/claude-haiku-4.5
+  provider: openrouter
 providers: {}
 fallback_providers: []
 credential_pool_strategies: {}
@@ -325,8 +325,8 @@ memory:
   nudge_interval: 10
   flush_min_turns: 6
 delegation:
-  model: ''
-  provider: ''
+  model: 'anthropic/claude-sonnet-4.6'
+  provider: 'openrouter'
   base_url: ''
   api_key: ''
   inherit_mcp_toolsets: true
@@ -402,7 +402,7 @@ hooks:
 hooks_auto_accept: false
 personalities: {}
 security:
-  allow_private_urls: false
+  allow_private_urls: true
   redact_secrets: true
   tirith_enabled: true
   tirith_path: tirith

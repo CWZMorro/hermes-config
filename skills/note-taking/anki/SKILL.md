@@ -129,9 +129,23 @@ curl -s -X POST http://172.17.0.1:8765 \
 
 ---
 
-## Step 2 — Sync to AnkiWeb immediately after adding cards
+## Step 2 — Verify the card was added locally
 
-Always run this after every batch of cards is added:
+After addNote or addNotes, verify the card actually exists using the returned note ID:
+
+```bash
+curl -s -X POST http://172.17.0.1:8765 \
+  -H "Content-Type: application/json" \
+  -d '{"action": "notesInfo", "version": 6, "params": {"notes": [<note_id>]}}'
+```
+
+If the response returns the note fields, the card is confirmed in the local Anki database. If it returns an empty array or error, the add failed — report this to the user and do not proceed.
+
+---
+
+## Step 3 — Sync to AnkiWeb
+
+Only sync after local confirmation. AnkiConnect returns no error even if the sync fails (e.g. not logged in to AnkiWeb). Tell the user the card is confirmed locally but cloud sync cannot be independently verified.
 
 ```bash
 curl -s -X POST http://172.17.0.1:8765 \
@@ -139,13 +153,11 @@ curl -s -X POST http://172.17.0.1:8765 \
   -d '{"action": "sync", "version": 6}'
 ```
 
-Response: `{"result": null, "error": null}` on success.
-
 ---
 
-## Step 3 — Append to local log
+## Step 4 — Append to local log
 
-After cards are confirmed in Anki, append them to `/opt/data/data/flashcards/<topic>.md`. Use a simple format:
+After the card is confirmed in Anki, append to `/opt/data/data/flashcards/<topic>.md`. Use a simple format:
 
 ```markdown
 - **Q:** Question here
@@ -153,6 +165,8 @@ After cards are confirmed in Anki, append them to `/opt/data/data/flashcards/<to
 ```
 
 If the file doesn't exist yet, create it and add an entry to `/opt/data/data/INDEX.md`.
+
+Do not tell the user the card is in Anki until Step 2 confirms it. Do not tell the user it synced to AnkiWeb — only that sync was triggered, since AnkiConnect cannot confirm cloud success.
 
 ---
 
