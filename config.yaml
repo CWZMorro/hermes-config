@@ -325,8 +325,8 @@ memory:
   nudge_interval: 10
   flush_min_turns: 6
 delegation:
-  model: 'anthropic/claude-sonnet-4.6'
-  provider: 'openrouter'
+  model: anthropic/claude-sonnet-4.6
+  provider: openrouter
   base_url: ''
   api_key: ''
   inherit_mcp_toolsets: true
@@ -375,7 +375,8 @@ discord:
 whatsapp:
   ignore_groups: false
   require_mention: true
-  wake_prefixes: ["!ciel"]
+  wake_prefixes:
+  - '!ciel'
 telegram:
   reactions: false
   channel_prompts: {}
@@ -395,7 +396,8 @@ approvals:
   cron_mode: deny
   mcp_reload_confirm: true
   destructive_slash_confirm: true
-command_allowlist: []
+command_allowlist:
+- delete in root path
 quick_commands: {}
 hooks:
   path: /root/.hermes/hooks/whatsapp_filter.py
