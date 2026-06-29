@@ -12,6 +12,30 @@ prerequisites:
   anki_plugin: "AnkiConnect (plugin ID: 2055492159)"
 ---
 
+## Content style guidelines (CWZ)
+
+### No 2nd person in card answers
+
+Never use "you", "your", or any second-person pronouns in the Back field or any answer text. Write impersonally. Bad: *"your armor loses more durability"* → Good: *"armor loses more durability points"* or *"the armor piece loses more durability."*
+
+### Precision over agreement
+
+If the user suggests phrasing that is technically incorrect or imprecise, say so — never agree just to take the path of least resistance. The user despises glazing. Fact-check all game mechanics against official wiki sources before writing the final answer. Source verify, then write.
+
+### Correction handling
+
+When a user corrects the Back field of an existing card:
+1. Verify the claim against the wiki/game source first (not just memory)
+2. Fix the card if wrong
+3. Say what changed and why — briefly, no re-explaining or arguing
+4. Move on immediately
+
+### Reference files
+
+- `references/minecraft-armor-durability.md` — sourced wiki data on durability formula, damage types, critical hit interaction, and max durability per piece type.
+
+---
+
 # Anki via AnkiConnect
 
 ## Default workflow — always follow this
@@ -104,7 +128,32 @@ curl -s -X POST http://172.17.0.1:8765 \
 
 Response: array of note IDs (`null` for duplicates that were skipped).
 
-### Cloze card
+### Cloze card — vocabulary (CWZ's format)
+
+Two lines in the Text field, word clozed in both. Same `c1` tag = one card that hides both instances. Newlines in JSON use `\\n`.
+
+```bash
+curl -s -X POST http://172.17.0.1:8765 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "action": "addNote",
+    "version": 6,
+    "params": {
+      "note": {
+        "deckName": "<deck name>",
+        "modelName": "Cloze",
+        "fields": {
+          "Text": "{{c1::Word}} means DEFINITION.\\ne.g. She {{c1::word}} EXAMPLE SENTENCE.",
+          "Back Extra": ""
+        },
+        "options": {"allowDuplicate": false},
+        "tags": []
+      }
+    }
+  }'
+```
+
+### Cloze card — general
 
 ```bash
 curl -s -X POST http://172.17.0.1:8765 \
