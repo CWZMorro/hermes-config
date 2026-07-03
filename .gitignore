@@ -1,0 +1,37 @@
+# Ignore everything
+/*
+
+
+!README.md
+!config.yaml
+!SOUL.md
+!bridge.js
+!setup.md
+!.gitignore
+
+# Skills
+!skills/
+skills/*
+!skills/note-taking/
+skills/note-taking/*
+!skills/note-taking/logseq/
+skills/note-taking/logseq/*
+!skills/note-taking/logseq/SKILL.md
+!skills/note-taking/logseq-flashcards/
+skills/note-taking/logseq-flashcards/*
+!skills/note-taking/logseq-flashcards/SKILL.md
+!skills/productivity/
+skills/productivity/*
+!skills/productivity/lists/
+skills/productivity/lists/*
+!skills/productivity/lists/SKILL.md
+!skills/media/
+skills/media/*
+!skills/media/spotify/
+skills/media/spotify/*
+!skills/media/spotify/SKILL.md
+!skills/messaging/
+skills/messaging/*
+!skills/messaging/whatsapp/
+skills/messaging/whatsapp/*
+!skills/messaging/whatsapp/SKILL.md

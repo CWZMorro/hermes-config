@@ -377,6 +377,7 @@ whatsapp:
   require_mention: true
   wake_prefixes:
   - '!ciel'
+  reply_prefix: "⚕ *Ciel AI Azure*\n────────────\n"
 telegram:
   reactions: false
   channel_prompts: {}
