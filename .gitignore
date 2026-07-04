@@ -8,6 +8,7 @@
 !bridge.js
 !setup.md
 !.gitignore
+!docker-compose.yml
 
 # Skills
 !skills/

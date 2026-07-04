@@ -400,8 +400,7 @@ approvals:
 command_allowlist:
 - delete in root path
 quick_commands: {}
-hooks:
-  path: /root/.hermes/hooks/whatsapp_filter.py
+hooks: {}
 hooks_auto_accept: false
 personalities: {}
 security:

@@ -1,0 +1,80 @@
+# Docker Compose definition for the Ciel AI Azure Hermes agent container.
+# Every field below was verified against `docker inspect` on the actual
+# running container before being written here (image, entrypoint, cmd, env,
+# mounts, ports, restart policy) — this is not a transcription of a
+# `docker run` command, it is the confirmed live configuration.
+#
+# Usage (from this directory):
+#   docker compose up -d       # create/start, or apply changes to this file
+#   docker compose down        # stop and remove
+#   docker compose logs -f     # follow logs
+#
+# Known fragility: the WhatsApp bridge's `node_modules` (installed at
+# /opt/hermes/scripts/whatsapp-bridge/node_modules) lives inside the
+# container's own writable layer, NOT on the /opt/data volume below. Any
+# time this container is recreated (including by `docker compose up -d`
+# picking up a change to this file), that directory is wiped and must be
+# reinstalled. The auto-install on boot runs as the unprivileged hermes
+# user, which does not own that directory (it's owned by UID 10000 from the
+# image build), so the auto-install fails silently. After any recreate, run:
+#   docker exec -u root ciel_ai_azure sh -c \
+#     "cd /opt/hermes/scripts/whatsapp-bridge && npm install --silent && chown -R hermes:hermes node_modules"
+#   docker restart ciel_ai_azure
+#
+# --- Setting this up on a new device ---
+# The lines marked "CHANGE THIS" below use paths/values specific to the
+# machine this was written on. Update them to match the new device before
+# running `docker compose up -d`.
+
+services:
+  ciel_ai_azure:
+    image: nousresearch/hermes-agent:latest
+    container_name: ciel_ai_azure
+    restart: unless-stopped
+    command: ["gateway", "run"]
+
+    ports:
+      - "43827:43827"
+      - "8642:8642"
+      - "9119:9119"
+
+    environment:
+      HERMES_DASHBOARD: "1"
+      # CHANGE THIS: must match the UID/GID of the host user that owns the
+      # directory bind-mounted below, or the container won't be able to
+      # read/write its own data. (id -u / id -g)
+      HERMES_UID: "1000"
+      HERMES_GID: "1000"
+      PYTHONUNBUFFERED: "1"
+      PLAYWRIGHT_BROWSERS_PATH: /opt/hermes/.playwright
+      npm_config_install_links: "false"
+      HERMES_WEB_DIST: /opt/hermes/hermes_cli/web_dist
+      HERMES_HOME: /opt/data
+
+    volumes:
+      # Lets the agent report host battery/power status. Linux-only; remove
+      # this line if the host doesn't have /sys/class/power_supply.
+      - /sys/class/power_supply:/sys/class/power_supply:ro
+
+      # CHANGE THIS: the cloned copy of this repo on the host. All of
+      # config.yaml, SOUL.md, skills, etc. are read from here.
+      - /home/cielarchazure/.hermes:/opt/data
+
+      # CHANGE THIS: path to the Logseq vault used for notes/flashcards/lists.
+      # Remove this line entirely if the Logseq skills aren't in use.
+      - /home/cielarchazure/Logseq/logseq-vault:/logseq
+
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+
+      # Overlays the customized bridge.js (adds !ciel group-trigger support,
+      # see README.md) onto the stock copy baked into the image. Must stay a
+      # single-file bind mount rather than living inside the /opt/data
+      # volume above: the gateway installs the bridge's npm dependencies
+      # next to whatever file bridge_script points at, and the stock
+      # location already has those dependencies pre-installed at image
+      # build time — pointing at a copy anywhere else would require shipping
+      # package.json/package-lock.json/allowlist.js too and reinstalling
+      # node_modules from scratch on every device.
+      # CHANGE THIS: left-hand side must match the repo path above.
+      - /home/cielarchazure/.hermes/bridge.js:/opt/hermes/scripts/whatsapp-bridge/bridge.js
