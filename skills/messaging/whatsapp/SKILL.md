@@ -55,6 +55,27 @@ WhatsApp contacts in `channel_directory.json` use `@lid` format (Linked Identity
 3. Call the bridge directly via curl.
 4. For groups already in the directory, use the `@g.us` JID directly.
 
+## Verifying if a Number Exists on WhatsApp
+
+The bridge does **not** expose an `onWhatsApp`-style HTTP endpoint, so you can't directly check whether a given phone number is registered on WhatsApp via the API.
+
+**Workaround — lid-mapping files in the session directory:**
+
+Baileys stores a file per known contact at `{session_dir}/lid-mapping-{digits}.json`. If the file exists, Baileys has encountered this number before (exchanged messages, received a presence update, or established a session with it). The file contains a LID string like `"227908178198549"`.
+
+```bash
+# Check if a contact is known
+ls /opt/data/whatsapp/session/lid-mapping-{digits}.json 2>/dev/null
+```
+
+If the file exists, you can also check for:
+- `lid-mapping-{lid}_reverse.json` — reverse mapping confirming consistent round-trip
+- `session-{lid}_1.0.json` — a stored session/encryption key, meaning actual messages were exchanged
+
+**Interpreting the results:** a lid-mapping file confirms the number is a real WhatsApp user that the bridge has encountered before. No file doesn't mean they aren't on WhatsApp — it just means no session data was synced with them yet (e.g. first contact, or contact is in the user's phonebook but never interacted with via this bridge).
+
+**Note:** the lid-mapping only confirms the *phone number* exists on WhatsApp, not the contact's saved name. The user-provided name (e.g. "Xuan Lin") is what it is — the numbers don't carry names.
+
 ## Admin Commands: /verify, /public-chat, /reply-delay
 
 The owner can control who else may DM the WhatsApp bot, and how their replies are paced. **You (the agent) are the one who acts on this most of the time** — the owner mostly asks in plain English, not exact command syntax.
