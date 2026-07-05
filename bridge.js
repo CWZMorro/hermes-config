@@ -13,6 +13,9 @@
  *   POST /typing         - Send typing indicator { chatId }
  *   GET  /chat/:id       - Get chat info
  *   GET  /health         - Health check
+ *   POST /verify         - Manage the verified-users allowlist { action: add|remove|list, number? }
+ *   POST /public-chat    - Toggle free-chat for verified users { enabled? } (omit to just read state)
+ *   POST /reply-delay    - Read/set the non-owner DM batch-reply window { seconds? }
  *
  * Usage:
  *   node bridge.js --port 3000 --session ~/.hermes/whatsapp/session
@@ -23,12 +26,12 @@ import express from 'express';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import path from 'path';
-import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync, chmodSync } from 'fs';
 import { randomBytes } from 'crypto';
 import { execSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
-import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+import { matchesAllowedUser, parseAllowedUsers, expandWhatsAppIdentifiers, normalizeWhatsAppIdentifier } from './allowlist.js';
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -93,12 +96,43 @@ function splitLongMessage(message, maxLength = MAX_MESSAGE_LENGTH) {
   return chunks;
 }
 
+// Splits a reply into separate WhatsApp message bubbles on paragraph
+// breaks (blank lines), so a multi-thought reply arrives as several short
+// texts like a person would send, instead of one long block. Each
+// resulting paragraph is still run through splitLongMessage in case it
+// alone exceeds the length cap.
+function splitIntoBubbles(message) {
+  const text = String(message || '');
+  if (!text) return [];
+  const paragraphs = text.split(/\n{2,}/).map((p) => p.trim()).filter(Boolean);
+  if (paragraphs.length <= 1) return splitLongMessage(text);
+  const bubbles = [];
+  for (const p of paragraphs) {
+    bubbles.push(...splitLongMessage(p));
+  }
+  return bubbles;
+}
+
 function trackSentMessageId(sent) {
   if (sent?.key?.id) {
     recentlySentIds.add(sent.key.id);
     if (recentlySentIds.size > MAX_RECENT_IDS) {
       recentlySentIds.delete(recentlySentIds.values().next().value);
     }
+  }
+}
+
+async function replySelf(chatId, message) {
+  if (!sock) return;
+  try {
+    const chunks = splitLongMessage(formatOutgoingMessage(message));
+    for (let i = 0; i < chunks.length; i += 1) {
+      const sent = await sock.sendMessage(chatId, { text: chunks[i] });
+      trackSentMessageId(sent);
+      if (chunks.length > 1 && i < chunks.length - 1) await sleep(CHUNK_DELAY_MS);
+    }
+  } catch (err) {
+    console.error('[bridge] Failed to send command reply:', err.message);
   }
 }
 
@@ -147,11 +181,235 @@ function buildLidMap() {
 }
 let lidToPhone = buildLidMap();
 
+// Verified-users allowlist + public-chat toggle, controlled from WhatsApp
+// itself via "/verify add|remove|list <number>" and "/public-chat [on|off]"
+// sent by the account owner in their own self-chat, or via the /verify and
+// /public-chat HTTP endpoints below (used by the agent on any platform —
+// see the whatsapp skill). Stored as plain files in SESSION_DIR so they
+// survive bridge restarts without touching .env.
+//
+// IMPORTANT: being in this list is NOT enough for a WhatsApp contact to
+// actually reach the agent. The Python gateway runs its own, independent
+// authorization check (gateway/run.py::_is_user_authorized) against the
+// WHATSAPP_ALLOWED_USERS env var and a separate pairing-approval store —
+// it has no idea this file exists. addVerifiedUser/removeVerifiedUser must
+// keep all three in sync, or a verified contact's messages get forwarded
+// by the bridge just fine and then silently dropped by the gateway anyway
+// (this happened in production: verified-users.json had a contact but
+// WHATSAPP_ALLOWED_USERS didn't, so every message from her logged
+// "Unauthorized user" and the agent never saw it).
+const VERIFIED_USERS_FILE = path.join(SESSION_DIR, 'verified-users.json');
+const PUBLIC_CHAT_FILE = path.join(SESSION_DIR, 'public-chat.json');
+const HERMES_HOME = process.env.HERMES_HOME || path.join(SESSION_DIR, '..', '..');
+const ENV_FILE = path.join(HERMES_HOME, '.env');
+const PAIRING_APPROVED_FILE = path.join(HERMES_HOME, 'platforms', 'pairing', 'whatsapp-approved.json');
+
+function loadVerifiedUsers() {
+  try {
+    if (!existsSync(VERIFIED_USERS_FILE)) return new Set();
+    const parsed = JSON.parse(readFileSync(VERIFIED_USERS_FILE, 'utf8'));
+    return new Set(Array.isArray(parsed) ? parsed.map(normalizeWhatsAppIdentifier).filter(Boolean) : []);
+  } catch {
+    return new Set();
+  }
+}
+
+// Keeps WHATSAPP_ALLOWED_USERS in .env in sync so the Python gateway's own
+// authorization check (which reads this env var independently of anything
+// in this file) grants the same access after the next restart. This alone
+// isn't enough for *immediate* effect (env vars are only re-read from .env
+// at process start) — see syncPairingApproval for the restart-free path.
+function syncEnvAllowedUsers(number, action) {
+  let lines;
+  try {
+    lines = readFileSync(ENV_FILE, 'utf8').split('\n');
+  } catch (err) {
+    console.error('[bridge] Failed to read .env for WHATSAPP_ALLOWED_USERS sync:', err.message);
+    return;
+  }
+  const lineRe = /^WHATSAPP_ALLOWED_USERS=(.*)$/;
+  let found = false;
+  for (let i = 0; i < lines.length; i += 1) {
+    const m = lines[i].match(lineRe);
+    if (!m) continue;
+    found = true;
+    const current = new Set(m[1].split(',').map((v) => v.trim()).filter(Boolean));
+    if (action === 'add') current.add(number);
+    else current.delete(number);
+    lines[i] = `WHATSAPP_ALLOWED_USERS=${Array.from(current).join(',')}`;
+    break;
+  }
+  if (!found) {
+    if (action !== 'add') return;
+    lines.push(`WHATSAPP_ALLOWED_USERS=${number}`);
+  }
+  try {
+    writeFileSync(ENV_FILE, lines.join('\n'));
+  } catch (err) {
+    console.error('[bridge] Failed to write .env for WHATSAPP_ALLOWED_USERS sync:', err.message);
+  }
+}
+
+// Writes straight into the Python gateway's pairing-approval store
+// (gateway/pairing.py — normally populated by the code-based DM pairing
+// flow). is_approved() re-reads this file from disk on every message with
+// no caching, so this takes effect immediately, no restart needed — unlike
+// the .env sync above. is_approved() does an exact string match on the
+// raw sender id including its "@..." suffix (no alias normalization), so
+// every known phone/LID alias is written in both JID shapes to cover
+// whichever form WhatsApp happens to report for a given message.
+function syncPairingApproval(number, action) {
+  let approved = {};
+  try {
+    if (existsSync(PAIRING_APPROVED_FILE)) {
+      approved = JSON.parse(readFileSync(PAIRING_APPROVED_FILE, 'utf8'));
+    }
+  } catch {
+    approved = {};
+  }
+
+  const aliases = expandWhatsAppIdentifiers(number, SESSION_DIR);
+  aliases.add(number);
+  const jids = new Set();
+  for (const alias of aliases) {
+    jids.add(`${alias}@s.whatsapp.net`);
+    jids.add(`${alias}@lid`);
+  }
+
+  if (action === 'add') {
+    for (const jid of jids) {
+      approved[jid] = { user_name: '', approved_at: Date.now() / 1000 };
+    }
+  } else {
+    for (const jid of jids) delete approved[jid];
+  }
+
+  try {
+    mkdirSync(path.dirname(PAIRING_APPROVED_FILE), { recursive: true });
+    writeFileSync(PAIRING_APPROVED_FILE, JSON.stringify(approved, null, 2));
+    try { chmodSync(PAIRING_APPROVED_FILE, 0o600); } catch { }
+  } catch (err) {
+    console.error('[bridge] Failed to sync pairing approval:', err.message);
+  }
+}
+
+function addVerifiedUser(number) {
+  const users = loadVerifiedUsers();
+  users.add(number);
+  writeFileSync(VERIFIED_USERS_FILE, JSON.stringify(Array.from(users), null, 2));
+  syncEnvAllowedUsers(number, 'add');
+  syncPairingApproval(number, 'add');
+}
+
+function removeVerifiedUser(number) {
+  const users = loadVerifiedUsers();
+  const existed = users.delete(number);
+  writeFileSync(VERIFIED_USERS_FILE, JSON.stringify(Array.from(users), null, 2));
+  syncEnvAllowedUsers(number, 'remove');
+  syncPairingApproval(number, 'remove');
+  return existed;
+}
+
+function matchesVerifiedUser(senderId) {
+  const verified = loadVerifiedUsers();
+  if (verified.size === 0) return false;
+  const aliases = expandWhatsAppIdentifiers(senderId, SESSION_DIR);
+  for (const alias of aliases) {
+    if (verified.has(alias)) return true;
+  }
+  return false;
+}
+
+function isPublicChatEnabled() {
+  try {
+    if (!existsSync(PUBLIC_CHAT_FILE)) return false;
+    return !!JSON.parse(readFileSync(PUBLIC_CHAT_FILE, 'utf8'))?.enabled;
+  } catch {
+    return false;
+  }
+}
+
+function setPublicChatEnabled(enabled) {
+  writeFileSync(PUBLIC_CHAT_FILE, JSON.stringify({ enabled: !!enabled }, null, 2));
+}
+
+// How long to wait, per DM chat, after a non-owner message before actually
+// forwarding it to the Python gateway. Any further messages from the same
+// chat during that window get appended to the same buffered event instead
+// of triggering a separate turn, so a person who sends several texts in a
+// row gets ONE reply covering all of them instead of the agent starting a
+// turn on the first one and having later ones straggle in mid-turn. Only
+// applies to non-owner DMs — the owner's own self-chat is always instant.
+const REPLY_DELAY_FILE = path.join(SESSION_DIR, 'reply-delay.json');
+const DEFAULT_REPLY_DELAY_SECONDS = 60;
+
+function getReplyDelaySeconds() {
+  try {
+    if (!existsSync(REPLY_DELAY_FILE)) return DEFAULT_REPLY_DELAY_SECONDS;
+    const seconds = Number(JSON.parse(readFileSync(REPLY_DELAY_FILE, 'utf8'))?.seconds);
+    return Number.isFinite(seconds) && seconds >= 0 ? seconds : DEFAULT_REPLY_DELAY_SECONDS;
+  } catch {
+    return DEFAULT_REPLY_DELAY_SECONDS;
+  }
+}
+
+function setReplyDelaySeconds(seconds) {
+  writeFileSync(REPLY_DELAY_FILE, JSON.stringify({ seconds }, null, 2));
+}
+
 const logger = pino({ level: 'warn' });
 
 // Message queue for polling
 const messageQueue = [];
 const MAX_QUEUE_SIZE = 100;
+
+// chatId -> { event, timer }. See getReplyDelaySeconds above.
+const pendingReplyBuffers = new Map();
+
+function enqueueMessage(event) {
+  if (messageQueue.length >= MAX_QUEUE_SIZE) messageQueue.shift();
+  messageQueue.push(event);
+}
+
+function flushPendingReply(chatId) {
+  const entry = pendingReplyBuffers.get(chatId);
+  if (!entry) return;
+  pendingReplyBuffers.delete(chatId);
+  enqueueMessage(entry.event);
+}
+
+// Debounced enqueue for non-owner DMs: merge this message into any pending
+// buffered event for the same chat and (re)start the delay timer, instead
+// of queuing immediately.
+function enqueueWithDebounce(event) {
+  const delaySeconds = getReplyDelaySeconds();
+  if (delaySeconds <= 0) {
+    enqueueMessage(event);
+    return;
+  }
+
+  const existing = pendingReplyBuffers.get(event.chatId);
+  if (existing) {
+    clearTimeout(existing.timer);
+    if (event.body) {
+      existing.event.body = existing.event.body ? `${existing.event.body}\n${event.body}` : event.body;
+    }
+    if (event.hasMedia) {
+      existing.event.hasMedia = true;
+      existing.event.mediaType = existing.event.mediaType || event.mediaType;
+      existing.event.mediaUrls.push(...event.mediaUrls);
+    }
+    existing.event.mentionedIds = event.mentionedIds;
+    existing.event.quotedParticipant = event.quotedParticipant;
+    existing.event.messageId = event.messageId;
+    existing.event.timestamp = event.timestamp;
+    existing.timer = setTimeout(() => flushPendingReply(event.chatId), delaySeconds * 1000);
+    return;
+  }
+
+  const timer = setTimeout(() => flushPendingReply(event.chatId), delaySeconds * 1000);
+  pendingReplyBuffers.set(event.chatId, { event, timer });
+}
 
 // Track recently sent message IDs to prevent echo-back loops with media
 const recentlySentIds = new Set();
@@ -249,6 +507,14 @@ async function startSocket() {
       const senderId = msg.key.participant || (msg.key.fromMe && !isGroup ? (sock.user?.id || chatId) : chatId);
       const senderNumber = senderId.replace(/@.*/, '');
 
+      // WhatsApp now uses LID (Linked Identity Device) format: 67427329167522@lid
+      // AND classic format: 34652029134@s.whatsapp.net
+      // sock.user has both: { id: "number:10@s.whatsapp.net", lid: "lid_number:10@lid" }
+      const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
+      const myLid = (sock.user?.lid || '').replace(/:.*@/, '@').replace(/@.*/, '');
+      const chatNumber = chatId.replace(/@.*/, '');
+      const isSelfChat = (myNumber && chatNumber === myNumber) || (myLid && chatNumber === myLid);
+
       // Handle fromMe messages based on mode
       if (msg.key.fromMe) {
         if (chatId.includes('status')) continue;
@@ -259,13 +525,6 @@ async function startSocket() {
         }
 
         // Self-chat mode: only allow messages in the user's own self-chat
-        // WhatsApp now uses LID (Linked Identity Device) format: 67427329167522@lid
-        // AND classic format: 34652029134@s.whatsapp.net
-        // sock.user has both: { id: "number:10@s.whatsapp.net", lid: "lid_number:10@lid" }
-        const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
-        const myLid = (sock.user?.lid || '').replace(/:.*@/, '@').replace(/@.*/, '');
-        const chatNumber = chatId.replace(/@.*/, '');
-        const isSelfChat = (myNumber && chatNumber === myNumber) || (myLid && chatNumber === myLid);
         if (!isSelfChat && !isGroup) {
           // Allow explicit !ciel trigger in DMs so the user can invoke the bot in any conversation
           const earlyContent = getMessageContent(msg);
@@ -280,26 +539,37 @@ async function startSocket() {
       // Python gateway, otherwise a pairing-code reply fires in response
       // to arbitrary incoming messages (#8389).
       //
-      // Exception: allowed users who explicitly type "!ciel" in a DM are
-      // let through even in self-chat mode, so the bot can respond to DMs.
+      // "!ciel" is an OWNER-ONLY trigger — it only ever applies to the
+      // owner's own fromMe messages (handled above), so they can invoke
+      // Hermes from any of their own chats, not just their self-chat. It
+      // is NOT a way for anyone else to reach Hermes, regardless of
+      // whether they're in ALLOWED_USERS or verified-users.json, and
+      // regardless of public-chat state — that used to be the behavior
+      // (a pre-existing mechanism this feature layered on top of) but it
+      // let verified users bypass the public-chat OFF state by typing
+      // "!ciel", which contradicts the whole point of the toggle. Anyone
+      // other than the owner needs isKnownUser (verified or
+      // allowlisted) AND public-chat ON — full stop, no prefix escape hatch.
       if (!msg.key.fromMe) {
+        const isVerified = !isGroup && matchesVerifiedUser(senderId);
+        const isKnownUser = isVerified || matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR);
         if (WHATSAPP_MODE === 'self-chat') {
-          const earlyContent = getMessageContent(msg);
-          const earlyBody = earlyContent.conversation || earlyContent.extendedTextMessage?.text || '';
-          const isExplicitTrigger = earlyBody.toLowerCase().startsWith('!ciel');
-          const isAllowed = matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR);
-          if (!isExplicitTrigger || !isAllowed) {
+          // Self-chat mode: the public-chat toggle is the ONLY gate for
+          // non-owner senders here — no "!ciel" escape hatch.
+          if (!(isKnownUser && isPublicChatEnabled())) {
             try {
               console.log(JSON.stringify({
                 event: 'ignored',
-                reason: isExplicitTrigger ? 'allowlist_mismatch' : 'self_chat_mode_rejects_non_self',
+                reason: isKnownUser ? 'public_chat_disabled' : 'self_chat_mode_rejects_non_self',
                 chatId,
                 senderId,
               }));
             } catch { }
             continue;
           }
-        } else if (!matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
+        } else if (!isKnownUser) {
+          // Bot mode has no self-chat/public-chat concept — being a known
+          // (verified or allowlisted) user is sufficient, same as before.
           try {
             console.log(JSON.stringify({
               event: 'ignored',
@@ -415,6 +685,62 @@ async function startSocket() {
         continue;
       }
 
+      // Owner-only admin commands, typed in the owner's own self-chat.
+      // Handled entirely here — never forwarded to the Python gateway.
+      if (msg.key.fromMe && isSelfChat && !isGroup) {
+        const trimmed = body.trim();
+        // Capture the whole rest of the line as the number, not just the
+        // first token — phone numbers are often typed with spaces/dashes
+        // ("+60 18-664 3008"), and \S+ used to truncate at the first space.
+        const verifyMatch = trimmed.match(/^\/verify\s+(add|remove|list)\b\s*(.*)$/i);
+        const publicChatMatch = trimmed.match(/^\/public-chat(?:\s+(on|off))?\s*$/i);
+        const replyDelayMatch = trimmed.match(/^\/reply-delay(?:\s+(\d+))?\s*$/i);
+        if (verifyMatch) {
+          const action = verifyMatch[1].toLowerCase();
+          if (action === 'list') {
+            const users = Array.from(loadVerifiedUsers());
+            await replySelf(chatId, users.length
+              ? `📋 Verified users:\n${users.join('\n')}`
+              : `📋 No verified users yet. Add one with /verify add <number>.`);
+          } else {
+            // digitsOnly, not normalizeWhatsAppIdentifier: the latter only
+            // strips a leading "+" and any "@..."/":...@" JID suffix, it
+            // doesn't remove spaces/dashes from a human-typed number.
+            const number = (verifyMatch[2] || '').replace(/[^\d]/g, '');
+            if (!number) {
+              await replySelf(chatId, `⚠️ Usage: /verify ${action} <number>`);
+            } else if (action === 'add') {
+              addVerifiedUser(number);
+              await replySelf(chatId, isPublicChatEnabled()
+                ? `✅ Verified ${number} — they can chat with Hermes freely now.`
+                : `✅ Verified ${number}. Send /public-chat on to let them chat with Hermes (they have no access until then — "!ciel" is yours only).`);
+            } else {
+              const existed = removeVerifiedUser(number);
+              await replySelf(chatId, existed
+                ? `🗑️ Removed ${number} from verified users.`
+                : `${number} wasn't verified.`);
+            }
+          }
+          continue;
+        }
+        if (publicChatMatch) {
+          const desired = publicChatMatch[1] ? publicChatMatch[1].toLowerCase() === 'on' : !isPublicChatEnabled();
+          setPublicChatEnabled(desired);
+          await replySelf(chatId, `🔓 Public chat is now ${desired ? 'ON' : 'OFF'}${desired ? ' — verified users can DM Hermes freely.' : ' — verified users have no access until this is back on.'}`);
+          continue;
+        }
+        if (replyDelayMatch) {
+          if (replyDelayMatch[1] !== undefined) {
+            setReplyDelaySeconds(Number(replyDelayMatch[1]));
+          }
+          const seconds = getReplyDelaySeconds();
+          await replySelf(chatId, seconds > 0
+            ? `⏱️ Reply delay for non-owner DMs is ${seconds}s — messages sent within that window of each other get batched into one reply.`
+            : `⏱️ Reply delay is OFF — non-owner DMs get an instant turn per message.`);
+          continue;
+        }
+      }
+
       if (body && body.toLowerCase().startsWith('!ciel')) {
         if (botIds.length > 0) {
           mentionedIds.push(botIds[0]); // Trick the Python Gateway
@@ -439,9 +765,14 @@ async function startSocket() {
         timestamp: msg.messageTimestamp,
       };
 
-      messageQueue.push(event);
-      if (messageQueue.length > MAX_QUEUE_SIZE) {
-        messageQueue.shift();
+      // Debounce non-owner DMs so a burst of several messages produces one
+      // reply instead of the agent starting a turn on the first message
+      // while later ones straggle in. Owner's own messages (self-chat or
+      // "!ciel"-triggered elsewhere) and groups stay instant.
+      if (!msg.key.fromMe && !isGroup) {
+        enqueueWithDebounce(event);
+      } else {
+        enqueueMessage(event);
       }
     }
   });
@@ -500,7 +831,10 @@ app.post('/send', async (req, res) => {
   }
 
   try {
-    const chunks = splitLongMessage(formatOutgoingMessage(message));
+    // Prefix goes on the first bubble only — repeating it on every bubble
+    // of a multi-message reply would be noisy.
+    const bubbles = splitIntoBubbles(message);
+    const chunks = bubbles.map((b, i) => (i === 0 ? formatOutgoingMessage(b) : b));
     const messageIds = [];
     for (let i = 0; i < chunks.length; i += 1) {
       const sent = await sock.sendMessage(chatId, { text: chunks[i] });
@@ -691,6 +1025,56 @@ app.get('/chat/:id', async (req, res) => {
     isGroup,
     participants: [],
   });
+});
+
+// Manage the verified-users allowlist. The single entry point for this —
+// the owner's in-chat "/verify ..." commands and the agent handling the
+// same request from Telegram/Discord/natural-language both hit this
+// instead of touching verified-users.json / .env / the pairing store
+// directly, so there's exactly one place that keeps all three in sync.
+app.post('/verify', (req, res) => {
+  const { action, number } = req.body || {};
+  if (!['add', 'remove', 'list'].includes(action)) {
+    return res.status(400).json({ error: 'action must be "add", "remove", or "list"' });
+  }
+  if (action === 'list') {
+    return res.json({ success: true, users: Array.from(loadVerifiedUsers()) });
+  }
+  const digits = String(number || '').replace(/[^\d]/g, '');
+  if (!digits) {
+    return res.status(400).json({ error: 'number is required and must contain digits' });
+  }
+  if (action === 'add') {
+    addVerifiedUser(digits);
+    return res.json({ success: true, number: digits, publicChatEnabled: isPublicChatEnabled() });
+  }
+  const existed = removeVerifiedUser(digits);
+  res.json({ success: true, number: digits, existed });
+});
+
+// Toggle (or read) the public-chat setting. POST {} reads current state;
+// POST { enabled: true|false } sets it explicitly.
+app.post('/public-chat', (req, res) => {
+  const { enabled } = req.body || {};
+  if (enabled !== undefined) {
+    setPublicChatEnabled(!!enabled);
+  }
+  res.json({ success: true, enabled: isPublicChatEnabled() });
+});
+
+// Read or set the non-owner DM reply-delay (debounce) window, in seconds.
+// POST {} reads current value; POST { seconds } sets it. 0 disables
+// debouncing entirely (instant per-message replies again).
+app.post('/reply-delay', (req, res) => {
+  const { seconds } = req.body || {};
+  if (seconds !== undefined) {
+    const n = Number(seconds);
+    if (!Number.isFinite(n) || n < 0) {
+      return res.status(400).json({ error: 'seconds must be a non-negative number' });
+    }
+    setReplyDelaySeconds(n);
+  }
+  res.json({ success: true, seconds: getReplyDelaySeconds() });
 });
 
 // Health check
