@@ -55,6 +55,14 @@ If no deck is specified, list available decks and ask the user which one to use.
 
 ### Vocabulary cloze
 
+**Single-line format (recommended)** — puts everything in one block so Logseq creates a proper cloze card, not a Basic front/back card:
+
+```
+- {{cloze Word}} means DEFINITION. e.g. She {{cloze word}} in EXAMPLE SENTENCE. #card
+```
+
+**Two-line format (avoid)** — this creates a Basic card where the example becomes the "answer", requiring two taps to reveal the word:
+
 ```
 - {{cloze Word}} means DEFINITION. #card
  - e.g. She {{cloze word}} in EXAMPLE SENTENCE.
